@@ -39,6 +39,21 @@ from .models import WebhookConversationMessage, WebhookConversationPayload
 _LOGGER = logging.getLogger(__name__)
 
 
+def _parse_stream_lines(lines: list[str]) -> list[dict[str, Any]]:
+    """Decode newline-delimited JSON events, skipping any that fail to parse."""
+    chunk_datas: list[dict[str, Any]] = []
+    for line_str in lines:
+        line_str = line_str.strip()
+        if line_str:
+            try:
+                chunk_datas.append(json.loads(line_str))
+            except json.JSONDecodeError:
+                _LOGGER.warning(
+                    "Failed to parse streaming response chunk: %s", line_str
+                )
+    return chunk_datas
+
+
 class WebhookConversationBaseEntity(Entity):
     """Base entity for webhook conversation integration providing shared basics."""
 
@@ -157,26 +172,52 @@ class WebhookConversationLLMBaseEntity(WebhookConversationBaseEntity):
                     f"Error contacting webhook: HTTP {response.status} - {response.reason}"
                 )
 
+            buffer = ""
             async for line in response.content:
                 if line:
                     line_str = line.decode("utf-8").strip()
                     if line_str:
+                        if line_str.startswith("data:"):
+                            # Server-sent events framing, used by Windmill's
+                            # sync_sse routes. n8n sends bare JSON lines.
+                            line_str = line_str.removeprefix("data:").strip()
+                        if not line_str or line_str == "[DONE]":
+                            continue
                         try:
                             chunk_data = json.loads(line_str)
-                            chunk_type = chunk_data.get("type")
-                            if chunk_type == "error":
-                                raise HomeAssistantError(
-                                    f"n8n error: {chunk_data.get('message', chunk_data)}"
-                                )
-                            # We don't break on "end" because n8n can send multiple
-                            # begin/end blocks when using tools or intermediate steps.
-                            # We keep reading until the stream actually closes.
-                            yield chunk_data
                         except json.JSONDecodeError:
                             _LOGGER.warning(
                                 "Failed to parse streaming response chunk: %s", line_str
                             )
                             continue
+                        if "new_result_stream" in chunk_data:
+                            # Windmill wraps the events in job envelopes carrying
+                            # an incremental NDJSON fragment, so a single event can
+                            # be split across two envelopes.
+                            buffer += chunk_data["new_result_stream"]
+                            *complete, buffer = buffer.split("\n")
+                            chunk_datas = _parse_stream_lines(complete)
+                        else:
+                            chunk_datas = [chunk_data]
+                        for chunk_data in chunk_datas:
+                            chunk_type = chunk_data.get("type")
+                            if chunk_type == "error":
+                                raise HomeAssistantError(
+                                    f"backend error: {chunk_data.get('message', chunk_data)}"
+                                )
+                            # We don't break on "end" because n8n can send multiple
+                            # begin/end blocks when using tools or intermediate steps.
+                            # We keep reading until the stream actually closes.
+                            yield chunk_data
+
+            # The last fragment is not necessarily newline terminated, so whatever
+            # is still buffered when the body ends is a complete event.
+            for chunk_data in _parse_stream_lines([buffer]):
+                if chunk_data.get("type") == "error":
+                    raise HomeAssistantError(
+                        f"backend error: {chunk_data.get('message', chunk_data)}"
+                    )
+                yield chunk_data
 
     def _build_payload(
         self, chat_log: conversation.ChatLog, include_last: bool = False

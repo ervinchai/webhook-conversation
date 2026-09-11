@@ -80,7 +80,8 @@ class WebhookAITaskEntity(WebhookConversationLLMBaseEntity, ai_task.AITaskEntity
         if self._streaming_enabled:
             reply_parts = []
             async for chunk_data in self._send_payload_streaming(payload):
-                if chunk_data.get("type") == "item" and "content" in chunk_data:
+                chunk_type = chunk_data.get("type")
+                if chunk_type in ("item", "token_delta") and "content" in chunk_data:
                     reply_parts.append(chunk_data["content"])
             reply = "".join(reply_parts)
         else:

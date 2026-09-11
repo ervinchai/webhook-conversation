@@ -199,7 +199,8 @@ class WebhookConversationEntity(
 
         async for chunk_data in self._send_payload_streaming(payload):
             _LOGGER.debug("Webhook streaming response: %s", chunk_data)
-            if chunk_data.get("type") == "item" and "content" in chunk_data:
+            chunk_type = chunk_data.get("type")
+            if chunk_type in ("item", "token_delta") and "content" in chunk_data:
                 yield {"content": chunk_data["content"]}
             elif chunk_data.get("type") == "tool_calls" and "tool_calls" in chunk_data:
                 tool_calls = _parse_tool_calls(chunk_data["tool_calls"])
